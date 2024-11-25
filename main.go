@@ -1,76 +1,133 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	_ "path/filepath"
+	"path"
 	"strings"
+	"sync/atomic"
 
 	"gopkg.in/yaml.v3"
 )
 
-func processYAML(input io.Reader) error {
-	decoder := yaml.NewDecoder(input)
+var unknownCounter atomic.Int32
 
-	for {
-		// Create a map to store the YAML document
-		var doc map[string]interface{}
-
-		// Decode the next document
-		err := decoder.Decode(&doc)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("error decoding YAML: %w", err)
-		}
-
-		// Skip empty documents
-		if doc == nil {
-			continue
-		}
-
-		// Extract kind and name
-		kind, _ := doc["kind"].(string)
-		metadata, _ := doc["metadata"].(map[string]interface{})
-		name, _ := metadata["name"].(string)
-
-		if kind == "" || name == "" {
-			continue
-		}
-
-		// Create output filename
-		outfileName := fmt.Sprintf("%s-%s.yaml", strings.ToLower(kind), name)
-
-		// Create output file
-		outfile, err := os.Create(outfileName)
-		if err != nil {
-			return fmt.Errorf("error creating file %s: %w", outfileName, err)
-		}
-		defer outfile.Close()
-
-		// Create encoder for output file
-		encoder := yaml.NewEncoder(outfile)
-		defer encoder.Close()
-
-		// Write the document
-		if err := encoder.Encode(doc); err != nil {
-			return fmt.Errorf("error writing to file %s: %w", outfileName, err)
+// isFilePath checks if the line starts with a file comment
+func isFilePath(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "#") {
+		filename := strings.TrimSpace(strings.TrimPrefix(line, "#"))
+		// Skip empty filenames and lines that are just comments
+		if filename != "" && filename != "." && !strings.HasPrefix(filename, " ") {
+			return filename, true
 		}
 	}
+	return "", false
+}
 
+func ensureDirectoryExists(filepath string) error {
+	dir := path.Dir(filepath)
+	if dir != "." {
+		return os.MkdirAll(dir, 0755)
+	}
 	return nil
 }
 
+func writeToFile(filename string, content []byte) error {
+	if err := ensureDirectoryExists(filename); err != nil {
+		return fmt.Errorf("error creating directory for %s: %w", filename, err)
+	}
+
+	if err := os.WriteFile(filename, content, 0644); err != nil {
+		return fmt.Errorf("error writing file %s: %w", filename, err)
+	}
+
+	fmt.Printf("Created: %s\n", filename)
+	return nil
+}
+
+func processYAML(input io.Reader) error {
+	var currentContent strings.Builder
+	var inDocument bool
+	var firstLine string
+	scanner := bufio.NewScanner(input)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Check for document separator
+		if line == "---" {
+			// Process previous document if exists
+			if inDocument {
+				if err := processDocument(firstLine, currentContent.String()); err != nil {
+					return err
+				}
+			}
+			// Reset for new document
+			currentContent.Reset()
+			inDocument = true
+			firstLine = ""
+			continue
+		}
+
+		// Store first non-empty line after separator
+		if inDocument && firstLine == "" && strings.TrimSpace(line) != "" {
+			firstLine = line
+		}
+
+		// Accumulate content
+		if inDocument {
+			currentContent.WriteString(line)
+			currentContent.WriteString("\n")
+		}
+	}
+
+	// Process last document
+	if inDocument {
+		return processDocument(firstLine, currentContent.String())
+	}
+
+	return scanner.Err()
+}
+
+func processDocument(firstLine, content string) error {
+	// First try to get filepath from comment
+	if filepath, ok := isFilePath(firstLine); ok {
+		return writeToFile(filepath, []byte(content))
+	}
+
+	// Try to parse as YAML
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+		// If parsing fails, write to unknown file
+		index := unknownCounter.Add(1)
+		return writeToFile(fmt.Sprintf("unknown-%d.txt", index), []byte(content))
+	}
+
+	// Check for kind/metadata/name structure
+	kind, _ := doc["kind"].(string)
+	metadata, _ := doc["metadata"].(map[string]interface{})
+	name, _ := metadata["name"].(string)
+
+	if kind != "" && name != "" {
+		filename := fmt.Sprintf("%s-%s.yaml", strings.ToLower(kind), name)
+		return writeToFile(filename, []byte(content))
+	}
+
+	// If no valid filename could be constructed, use unknown
+	index := unknownCounter.Add(1)
+	return writeToFile(fmt.Sprintf("unknown-%d.txt", index), []byte(content))
+}
+
 func main() {
-	// Parse command line flags
 	flag.Parse()
 
 	var err error
 	if flag.NArg() == 0 {
-		// No arguments - read from stdin
+		// Read from stdin
 		stat, _ := os.Stdin.Stat()
 		if (stat.Mode() & os.ModeCharDevice) != 0 {
 			fmt.Fprintln(os.Stderr, "Usage: yamlsplitter [filename] or cat yourfile.yaml | yamlsplitter")
