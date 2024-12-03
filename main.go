@@ -15,17 +15,55 @@ import (
 
 var unknownCounter atomic.Int32
 
-// isFilePath checks if the line starts with a file comment
 func isFilePath(line string) (string, bool) {
 	line = strings.TrimSpace(line)
 	if strings.HasPrefix(line, "#") {
 		filename := strings.TrimSpace(strings.TrimPrefix(line, "#"))
-		// Skip empty filenames and lines that are just comments
-		if filename != "" && filename != "." && !strings.HasPrefix(filename, " ") {
+		if filename == "" || filename == "." || strings.HasPrefix(filename, " ") {
+			return "", false
+		}
+
+		if strings.Contains(filename, "├") || strings.Contains(filename, "└") ||
+			strings.Contains(filename, "--") || strings.Contains(filename, "│") {
+			return "", false
+		}
+
+		if strings.Contains(filename, "/") {
 			return filename, true
+		}
+
+		if strings.Contains(filename, ".") || filename == "Makefile" {
+			if strings.Contains(filename, "/") {
+				return filename, true
+			}
+			return strings.TrimSpace(filename), true
 		}
 	}
 	return "", false
+}
+
+func isLikelyContent(s string) bool {
+	if strings.Contains(s, "├──") || strings.Contains(s, "└──") {
+		return false
+	}
+
+	indicators := []string{
+		"apiVersion:",
+		"kind:",
+		"metadata:",
+		"spec:",
+		"data:",
+		"rules:",
+		".PHONY",
+		"#!/",
+	}
+
+	for _, indicator := range indicators {
+		if strings.Contains(s, indicator) {
+			return true
+		}
+	}
+	return false
 }
 
 func ensureDirectoryExists(filepath string) error {
@@ -54,39 +92,47 @@ func processYAML(input io.Reader) error {
 	var inDocument bool
 	var firstLine string
 	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024*10) // 10MB buffer
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		trimmedLine := strings.TrimSpace(line)
 
-		// Check for document separator
 		if line == "---" {
-			// Process previous document if exists
-			if inDocument {
+			if inDocument && currentContent.Len() > 0 {
 				if err := processDocument(firstLine, currentContent.String()); err != nil {
 					return err
 				}
 			}
-			// Reset for new document
 			currentContent.Reset()
 			inDocument = true
 			firstLine = ""
 			continue
 		}
 
-		// Store first non-empty line after separator
-		if inDocument && firstLine == "" && strings.TrimSpace(line) != "" {
+		if !inDocument && trimmedLine != "" && strings.HasPrefix(trimmedLine, "#") {
+			if _, ok := isFilePath(line); ok {
+				if currentContent.Len() > 0 && isLikelyContent(currentContent.String()) {
+					if err := processDocument(firstLine, currentContent.String()); err != nil {
+						return err
+					}
+					currentContent.Reset()
+				}
+				firstLine = line
+				inDocument = true
+				continue
+			}
+		}
+
+		if inDocument && firstLine == "" && trimmedLine != "" {
 			firstLine = line
 		}
 
-		// Accumulate content
-		if inDocument {
-			currentContent.WriteString(line)
-			currentContent.WriteString("\n")
-		}
+		currentContent.WriteString(line)
+		currentContent.WriteString("\n")
 	}
 
-	// Process last document
-	if inDocument {
+	if (inDocument || currentContent.Len() > 0) && isLikelyContent(currentContent.String()) {
 		return processDocument(firstLine, currentContent.String())
 	}
 
@@ -94,20 +140,19 @@ func processYAML(input io.Reader) error {
 }
 
 func processDocument(firstLine, content string) error {
-	// First try to get filepath from comment
-	if filepath, ok := isFilePath(firstLine); ok {
-		return writeToFile(filepath, []byte(content))
+	if filepath, ok := isFilePath(firstLine); ok && strings.TrimSpace(content) != "" {
+		if err := os.MkdirAll(path.Dir(filepath), 0755); err != nil {
+			return fmt.Errorf("error creating directories for %s: %w", filepath, err)
+		}
+		return writeToFile(filepath, []byte(strings.TrimSpace(content)+"\n"))
 	}
 
-	// Try to parse as YAML
 	var doc map[string]interface{}
 	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
-		// If parsing fails, write to unknown file
 		index := unknownCounter.Add(1)
 		return writeToFile(fmt.Sprintf("unknown-%d.txt", index), []byte(content))
 	}
 
-	// Check for kind/metadata/name structure
 	kind, _ := doc["kind"].(string)
 	metadata, _ := doc["metadata"].(map[string]interface{})
 	name, _ := metadata["name"].(string)
@@ -117,7 +162,6 @@ func processDocument(firstLine, content string) error {
 		return writeToFile(filename, []byte(content))
 	}
 
-	// If no valid filename could be constructed, use unknown
 	index := unknownCounter.Add(1)
 	return writeToFile(fmt.Sprintf("unknown-%d.txt", index), []byte(content))
 }
@@ -127,7 +171,6 @@ func main() {
 
 	var err error
 	if flag.NArg() == 0 {
-		// Read from stdin
 		stat, _ := os.Stdin.Stat()
 		if (stat.Mode() & os.ModeCharDevice) != 0 {
 			fmt.Fprintln(os.Stderr, "Usage: yamlsplitter [filename] or cat yourfile.yaml | yamlsplitter")
@@ -135,7 +178,6 @@ func main() {
 		}
 		err = processYAML(os.Stdin)
 	} else {
-		// Read from file
 		filename := flag.Arg(0)
 		file, err := os.Open(filename)
 		if err != nil {
