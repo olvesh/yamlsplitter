@@ -14,6 +14,7 @@ import (
 )
 
 var unknownCounter atomic.Int32
+var generateNameCounters = make(map[string]int)
 
 func isFilePath(line string) (string, bool) {
 	line = strings.TrimSpace(line)
@@ -156,9 +157,16 @@ func processDocument(firstLine, content string) error {
 	kind, _ := doc["kind"].(string)
 	metadata, _ := doc["metadata"].(map[string]interface{})
 	name, _ := metadata["name"].(string)
+	generateName, _ := metadata["generateName"].(string)
 
-	if kind != "" && name != "" {
-		filename := fmt.Sprintf("%s-%s.yaml", strings.ToLower(kind), name)
+	if kind != "" && (name != "" || generateName != "") {
+		resourceName := name
+		if resourceName == "" {
+			counter := generateNameCounters[generateName]
+			generateNameCounters[generateName] = counter + 1
+			resourceName = fmt.Sprintf("%s%d", generateName, counter)
+		}
+		filename := fmt.Sprintf("%s-%s.yaml", strings.ToLower(kind), resourceName)
 		return writeToFile(filename, []byte(content))
 	}
 
